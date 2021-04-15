@@ -64,9 +64,13 @@ class RocksStorage : public StorageNode
 		// Special case (PredicateNode "*-TruthValueKey-*")
 		std::string tv_pred_sid;
 
-		// Several operations really need to be exclusive.
-		std::mutex _mtx_list;
+		// Issue of sid needs to be atomic.
 		std::mutex _mtx_sid;
+
+#ifdef NEED_LIST_LOCK
+		// Gaurantee atomic update of atom plus it's incoming set.
+		std::recursive_mutex _mtx_list;
+#endif
 
 		// Assorted helper functions
 		std::string findAtom(const Handle&);
@@ -82,6 +86,8 @@ class RocksStorage : public StorageNode
 		void getKeys(AtomSpace*, const std::string&, const Handle&);
 		void loadAtoms(AtomTable& table, const std::string& pfx);
 		void loadInset(AtomSpace*, const std::string& ist);
+		void appendToInset(const std::string&, const std::string&);
+		void remFromInset(const std::string&, const std::string&);
 
 		void removeSatom(const std::string&, const std::string&, bool, bool);
 		void remIncoming(const std::string&, const std::string&,

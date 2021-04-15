@@ -33,6 +33,11 @@
 
 using namespace opencog;
 
+// The old incoming-list needs locks.
+#if USE_INLIST_STRING
+	#define NEED_LIST_LOCK 1
+#endif // USE_INLIST_STRING
+
 /// int to base-62 We use base62 not base64 because we
 /// want to reserve punctuation "just in case" as special chars.
 std::string RocksStorage::aidtostr(uint64_t aid) const
@@ -88,11 +93,11 @@ static const char* aid_key = "*-NextUnusedAID-*";
 // shash == 64-bit hash of the Atom (as provided by Atom::get_hash())
 
 // Prefixes and associative pairs in the Rocks DB are:
-// "a@" sid . [shash]satom -- finds the satom associated with sid
+// "a@" sid: . [shash]satom -- finds the satom associated with sid
 // "l@" satom . sid -- finds the sid associated with the Link
 // "n@" satom . sid -- finds the sid associated with the Node
 // "k@" sid:kid . sval -- find the Atomese Value for the Atom,Key
-// "i@" sid:stype . sid-list -- finds IncomingSet of sid
+// "i@" sid:stype-sid . (null) -- finds IncomingSet of sid
 // "h@" shash . sid-list -- finds all sids having a given hash
 
 // General design:
@@ -119,10 +124,17 @@ static const char* aid_key = "*-NextUnusedAID-*";
 //
 // The same trick is applied for incoming-sets. So, the entire
 // incoming set for an atom appears under the prefix `i@sid:` and
-// the incoming set of a given type is under `i@sid:stype`.  The
-// incoming set itself is stored as a space-separated list of sids.
-// This works, but has the (minor!?) disadvantage that this list has
-// to be edited every time an atom is added or removed.
+// the incoming set of a given type is under `i@sid:stype`.  There
+// are two choices for how to store the incoming set: either as a
+// long space-separated list of sids, or by encoding each sid into
+// it's own key. The former style seems to cause issues when the
+// incoming set is large: the update of the large string seems to
+// drive RocksDB just crazy, leading to RAM and dis-usage issues.
+// See https://github.com/facebook/rocksdb/issues/3216 for more.
+//
+// The current code will use the space-separated list when
+// #define USE_INLIST_STRING 1 is set, otherwise it uses one key
+// per incoming.
 //
 // That's pretty much it ... except that there's one last little tricky
 // bit, forced on us by alpha-equivalence and alpha-conversion.
@@ -157,33 +169,22 @@ static const char* aid_key = "*-NextUnusedAID-*";
 // ======================================================================
 // Some notes about threading and locking.
 //
-// The current implementation is minimalist, and uses only one mutex
-// to ensure the safety of the one obviously-racey section, where
-// multiple threads might be editing the IncomingSet of the same
-// Atom.  (We use only one lock to protect *all* incoming sets.)
+// The current implementation is minimal; it uses one mutex to protect
+// the increment and issue of new sid's (new numeric ID's for each atom).
 //
-// Note that, even without this lock, the current multi-threading
-// test i.e. MultiPersistUTest passes just fine. Maybe the test is
-// too short, or too small, or doesn't do anything dangerous...
-//
-// Besides the above, there may be other racey usages that are not
-// anticipated. For example, if one thread is getting the same Atom
-// that another thread is deleting, it might be possible to arrive at
-// some weird state, possibly with a crash(??) or a malfunctioning
-// get(??). This code has NOT been audited for this situation.
-// The degree of safety here for production usage is unknown.
-// (That's why it's version 0.8 right now, as of 4 August 2020.)
-// The good news: this file is really pretty small, as such things go,
-// so auditing should not be that hard.
+// There is another mutex that guarantees that the update of the atom
+// plus it's incoming set will be atomic. This was needed in an earlier
+// incoming-set design; it's not needed in the current design. It's been
+// left in the code, #ifdef'ed out, just in case something blows up.
 
 // ======================================================================
 /// Place Atom into storage.
 /// Return the matching sid.
 std::string RocksStorage::writeAtom(const Handle& h)
 {
-	// The issue of new sids needs to be atomic, as otherwise we risk
-	// having the Get(pfx + satom) fail in parallel, and have two
-	// different sids issued for the same atom.
+	// The issueance of new sids needs to be atomic, as otherwise we
+	// risk having the Get(pfx + satom) fail in parallel, and have
+	// two different sids issued for the same atom.
 	std::unique_lock<std::mutex> lck(_mtx_sid, std::defer_lock);
 
 	std::string shash, sid, satom, pfx;
@@ -219,12 +220,20 @@ std::string RocksStorage::writeAtom(const Handle& h)
 	// twice.
 	_rfile->Put(rocksdb::WriteOptions(), aid_key, sid);
 
-	// logger().debug("Store sid=>>%s<< for >>%s<<", sid.c_str(), satom.c_str());
-	_rfile->Put(rocksdb::WriteOptions(), pfx + satom, sid);
-	_rfile->Put(rocksdb::WriteOptions(), "a@" + sid, shash+satom);
-
 	// The rest is safe to do in parallel.
 	lck.unlock();
+
+#ifdef NEED_LIST_LOCK
+	// The-read-modify-write of the incoming-set list has to be
+	// protected from other callers, as well as from the atom
+	// deletion code. Delete races are checked with a@ and so the
+	// update of a@ and i@ must be atomic.
+	std::lock_guard<std::recursive_mutex> lilck(_mtx_list);
+#endif
+
+	// logger().debug("Store sid=>>%s<< for >>%s<<", sid.c_str(), satom.c_str());
+	_rfile->Put(rocksdb::WriteOptions(), pfx + satom, sid);
+	_rfile->Put(rocksdb::WriteOptions(), "a@" + sid + ":", shash+satom);
 
 	if (convertible)
 		appendToSidList(shash, sid);
@@ -242,7 +251,7 @@ std::string RocksStorage::writeAtom(const Handle& h)
 	for (const Handle& ho : h->getOutgoingSet())
 	{
 		std::string ist = "i@" + writeAtom(ho) + stype;
-		appendToSidList(ist, sid);
+		appendToInset(ist, sid);
 	}
 
 	return sid;
@@ -287,10 +296,6 @@ void RocksStorage::storeValue(const Handle& h, const Handle& key)
 void RocksStorage::appendToSidList(const std::string& klist,
                                    const std::string& sid)
 {
-	// The-read-modify-write of the list has to be protected
-	// from other callers, as well as from the deletion code.
-	std::lock_guard<std::mutex> lck(_mtx_list);
-
 	std::string sidlist;
 	rocksdb::Status s = _rfile->Get(rocksdb::ReadOptions(), klist, &sidlist);
 	if (not s.ok() or std::string::npos == sidlist.find(sid))
@@ -307,7 +312,8 @@ void RocksStorage::appendToSidList(const std::string& klist,
 Handle RocksStorage::getAtom(const std::string& sid)
 {
 	std::string satom;
-	rocksdb::Status s = _rfile->Get(rocksdb::ReadOptions(), "a@" + sid, &satom);
+	rocksdb::Status s = _rfile->Get(rocksdb::ReadOptions(),
+		"a@" + sid + ":", &satom);
 	if (not s.ok())
 		throw IOException(TRACE_INFO, "Internal Error!");
 
@@ -367,7 +373,9 @@ void RocksStorage::getKeys(AtomSpace* as,
 			// because doing it any other way would require
 			// tracking keys. Which is hard; the atomspace was
 			// designed to NOT track keys on purpose, for efficiency.)
-			std::lock_guard<std::mutex> lck(_mtx_list);
+#ifdef NEED_LIST_LOCK
+			std::lock_guard<std::recursive_mutex> lck(_mtx_list);
+#endif
 			_rfile->Delete(rocksdb::WriteOptions(), it->key());
 			continue;
 		}
@@ -393,6 +401,7 @@ void RocksStorage::getKeys(AtomSpace* as,
 		if (vp) vp = as->add_atoms(vp);
 		h->setValue(key, vp);
 	}
+	delete it;
 }
 
 /// Backend callback - get the Atom
@@ -505,7 +514,8 @@ void RocksStorage::removeAtom(const Handle& h, bool recursive)
 		if (0 == sid.size()) return;
 
 		// Get the matching satom string.
-		rocksdb::Status s = _rfile->Get(rocksdb::ReadOptions(), "a@" + sid, &satom);
+		rocksdb::Status s = _rfile->Get(rocksdb::ReadOptions(),
+			"a@" + sid + ":", &satom);
 		if (not s.ok())
 			throw IOException(TRACE_INFO, "Internal Error!");
 	}
@@ -519,10 +529,12 @@ void RocksStorage::removeAtom(const Handle& h, bool recursive)
 		if (0 == sid.size()) return;
 	}
 
+#ifdef NEED_LIST_LOCK
 	// Removal needs to be atomic, and not race with other
 	// removals, nor with other manipulations of the incoming
 	// set. A plain-old lock is the easiest way to get this.
-	std::lock_guard<std::mutex> lck(_mtx_list);
+	std::lock_guard<std::recursive_mutex> lck(_mtx_list);
+#endif
 	removeSatom(satom, sid, h->is_node(), recursive);
 }
 
@@ -548,7 +560,7 @@ void RocksStorage::remIncoming(const std::string& sid,
 	// Get the incoming set. Since we have the type, we can get this
 	// directly, without needing any loops.
 	std::string ist = "i@" + osid + ":" + stype;
-	remFromSidList(ist, sid);
+	remFromInset(ist, sid);
 }
 
 /// Remove `sid` from the list of sids stored at `klist`.
@@ -562,15 +574,28 @@ void RocksStorage::remFromSidList(const std::string& klist,
 
 	// Some consistency checks ...
 	if (0 == sidlist.size())
-		throw IOException(TRACE_INFO, "Internal Error!");
+		throw NotFoundException(TRACE_INFO, "Internal Error!");
 
-	size_t pos = sidlist.find(sid);
+	// Search for the sid in the sidlist. If must be either the
+	// very first sid in the list, or it must be preceeded and
+	// followed by whitespace. Else we risk finding a substring
+	// of some other sid. We don't want substrings!
+	std::string sidblank = sid + " ";
+	size_t sidlen = sidblank.size();
+	size_t pos = sidlist.find(sidblank);
+	while (std::string::npos != pos and 0 < pos)
+	{
+		if (' ' != sidlist[pos-1])
+			pos = sidlist.find(sidblank, pos+sidlen);
+		else
+			break;
+	}
 	if (std::string::npos == pos)
-		throw IOException(TRACE_INFO, "Internal Error!");
+		throw NotFoundException(TRACE_INFO, "Internal Error!");
 
 	// That's it. Now edit the sidlist string, remove the sid
 	// from it, and store it as the new sidlist. Unless its empty...
-	sidlist.replace(pos, sid.size() + 1, "");
+	sidlist.replace(pos, sidlen, "");
 	if (0 == sidlist.size())
 		_rfile->Delete(rocksdb::WriteOptions(), klist);
 	else
@@ -590,12 +615,18 @@ void RocksStorage::removeSatom(const std::string& satom,
 	// So first, iterate up to the top, chopping away the incoming set.
 	// It's stored with prefixes according to type, so this is a loop...
 	std::string ist = "i@" + sid + ":";
+
+#if USE_INLIST_STRING
 	auto it = _rfile->NewIterator(rocksdb::ReadOptions());
 	for (it->Seek(ist); it->Valid() and it->key().starts_with(ist); it->Next())
 	{
 		// If there is an incoming set, but were are not recursive,
 		// then refuse to do anything more.
-		if (not recursive) return;
+		if (not recursive)
+		{
+			delete it;
+			return;
+		}
 
 		// The list of sids of incoming Atoms.
 		std::string inset = it->value().ToString();
@@ -609,7 +640,7 @@ void RocksStorage::removeSatom(const std::string& satom,
 			// Get the matching atom.
 			const std::string& isid = inset.substr(nsk, last-nsk);
 			std::string isatom;
-			_rfile->Get(rocksdb::ReadOptions(), "a@" + isid, &isatom);
+			_rfile->Get(rocksdb::ReadOptions(), "a@" + isid + ":", &isatom);
 
 			// Its possible its been already removed. For example,
 			// delete a in (Link (Link a b) a)
@@ -623,6 +654,35 @@ void RocksStorage::removeSatom(const std::string& satom,
 		// Finally, delete the inset itself.
 		_rfile->Delete(rocksdb::WriteOptions(), it->key());
 	}
+	delete it;
+#else
+	size_t istlen = ist.size();
+	auto it = _rfile->NewIterator(rocksdb::ReadOptions());
+	for (it->Seek(ist); it->Valid() and it->key().starts_with(ist); it->Next())
+	{
+		// If there is an incoming set, but were are not recursive,
+		// then refuse to do anything more.
+		if (not recursive)
+		{
+			delete it;
+			return;
+		}
+
+		// The key is of the form `i@ABC:ConceptNode-456`
+		// where `456` is the sid that we want.
+		const std::string& frag = it->key().ToString().substr(istlen);
+		size_t offset = frag.find('-') + 1;
+		const std::string& isid = frag.substr(offset);
+		std::string isatom;
+		_rfile->Get(rocksdb::ReadOptions(), "a@" + isid + ":", &isatom);
+
+		// Its possible its been already removed. For example,
+		// delete a in (Link (Link a b) a)
+		if (0 < isatom.size())
+			removeSatom(isatom, isid, false, recursive);
+	}
+	delete it;
+#endif
 
 	// If the atom to be deleted has a hash, we need to remove it
 	// (the atom) from the list of other atoms having the same hash.
@@ -665,28 +725,72 @@ void RocksStorage::removeSatom(const std::string& satom,
 
 			// Perform the deduplicated delete.
 			for (const std::string& osatom : soset)
-				remIncoming(sid, stype, osatom);
+			{
+				// Two diferent threads may be racing to delete the same
+				// atom. If so, the second thread loses and throws a
+				// consistency check error. If it lost, we just ignore
+				// the error here. Triggered by MultiDeleteUTest.
+				try
+				{
+					remIncoming(sid, stype, osatom);
+				}
+				catch(const NotFoundException& ex)
+				{
+					std::string satom;
+					rocksdb::Status s = _rfile->Get(rocksdb::ReadOptions(),
+						"a@" + sid + ":", &satom);
+					if (s.ok()) throw;
+				}
+			}
 		}
 	}
 
 	// Delete the Atom, next.
 	std::string pfx = is_node ? "n@" : "l@";
 	_rfile->Delete(rocksdb::WriteOptions(), pfx + satom.substr(paren));
-	_rfile->Delete(rocksdb::WriteOptions(), "a@" + sid);
+	_rfile->Delete(rocksdb::WriteOptions(), "a@" + sid + ":");
 
 	// Delete all values hanging on the atom ...
-	pfx = "k@" + sid;
+	pfx = "k@" + sid + ":";
 	it = _rfile->NewIterator(rocksdb::ReadOptions());
 	for (it->Seek(pfx); it->Valid() and it->key().starts_with(pfx); it->Next())
 		_rfile->Delete(rocksdb::WriteOptions(), it->key());
+	delete it;
 }
 
 // =========================================================
 // Work with the incoming set
 
+void RocksStorage::appendToInset(const std::string& klist,
+                                 const std::string& sid)
+{
+#if USE_INLIST_STRING
+	appendToSidList(klist, sid);
+#else
+	std::string key = klist + "-" + sid;
+	rocksdb::Status s = _rfile->Put(rocksdb::WriteOptions(), key, "");
+	if (not s.ok())
+		throw IOException(TRACE_INFO, "Internal Error!");
+#endif
+}
+
+void RocksStorage::remFromInset(const std::string& klist,
+                                const std::string& sid)
+{
+#if USE_INLIST_STRING
+	remFromSidList(klist, sid);
+#else
+	std::string key = klist + "-" + sid;
+	rocksdb::Status s = _rfile->Delete(rocksdb::WriteOptions(), key);
+	if (not s.ok())
+		throw IOException(TRACE_INFO, "Internal Error!");
+#endif
+}
+
 /// Load the incoming set based on the key prefix `ist`.
 void RocksStorage::loadInset(AtomSpace* as, const std::string& ist)
 {
+#if USE_INLIST_STRING
 	auto it = _rfile->NewIterator(rocksdb::ReadOptions());
 	for (it->Seek(ist); it->Valid() and it->key().starts_with(ist); it->Next())
 	{
@@ -706,6 +810,30 @@ void RocksStorage::loadInset(AtomSpace* as, const std::string& ist)
 			last = inlist.find(' ', nsk);
 		}
 	}
+	delete it;
+#else
+
+	// `ist` is either `i@ABC:ConceptNode-` or else it is
+	// just `i@ABC:` and we have to search for the dash.
+	size_t istlen = ist.size();
+	size_t offset = -1;
+	if ('-' == ist[istlen - 1]) offset = 0;
+
+	auto it = _rfile->NewIterator(rocksdb::ReadOptions());
+	for (it->Seek(ist); it->Valid() and it->key().starts_with(ist); it->Next())
+	{
+		const std::string& frag = it->key().ToString().substr(istlen);
+
+		// The sid is appended to the key.
+		if (0 != offset) offset = frag.find('-') + 1;
+		const std::string& sid = frag.substr(offset);
+
+		Handle hi = getAtom(sid);
+		getKeys(as, sid, hi);
+		as->add_atom(hi);
+	}
+	delete it;
+#endif
 }
 
 /// Backing API - get the incoming set.
@@ -751,6 +879,7 @@ void RocksStorage::loadAtoms(AtomTable &table, const std::string& pfx)
 		getKeys(as, it->value().ToString(), h);
 		table.add(h);
 	}
+	delete it;
 }
 
 /// Backing API - load the entire AtomSpace.
@@ -776,6 +905,7 @@ void RocksStorage::loadType(AtomTable &table, Type t)
 		getKeys(as, it->value().ToString(), h);
 		table.add(h);
 	}
+	delete it;
 }
 
 void RocksStorage::storeAtomSpace(const AtomTable &table)
@@ -800,6 +930,7 @@ void RocksStorage::kill_data(void)
 	auto it = _rfile->NewIterator(rocksdb::ReadOptions());
 	for (it->Seek(""); it->Valid(); it->Next())
 		_rfile->Delete(rocksdb::WriteOptions(), it->key());
+	delete it;
 #endif
 
 	// Reset.
@@ -816,6 +947,7 @@ void RocksStorage::print_range(const std::string& pfx)
 		printf("rkey: >>%s<<    rval: >>%s<<\n",
 			it->key().ToString().c_str(), it->value().ToString().c_str());
 	}
+	delete it;
 }
 
 /// Return a count of the number of records with the indicated prefix
@@ -826,6 +958,7 @@ size_t RocksStorage::count_records(const std::string& pfx)
 	for (it->Seek(pfx); it->Valid() and it->key().starts_with(pfx); it->Next())
 		cnt++;
 
+	delete it;
 	return cnt;
 }
 

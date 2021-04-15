@@ -27,6 +27,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+#include <sys/resource.h>
 
 #include "rocksdb/db.h"
 #include "rocksdb/slice.h"
@@ -63,6 +64,31 @@ void RocksStorage::init(const char * uri)
 
 	// Create the file if it doesn't exist yet.
 	options.create_if_missing = true;
+
+	// The primary consumer of disk and RAM in RocksDB are the `*.sst`
+	// files: each one is opened and memory-mapped. RocksDB does NOT
+	// check the `ulimit -n` setting, and can overflow it, resulting
+	// in failed reads and dropped writes. We MUST set `max_open_files`
+	// to an acceptable value. Rocks will run, just more slowly, when
+	// it hits this limit.
+	//
+	// For me, each sst file averages about 40MBytes, with a roughly
+	// comparable amount of RAM usage. Thus, the linux default of 1024
+	// limits RAM usage to about 40GBytes.
+	//
+	// The setting is a bit of a guesstimate: guile+opencog currently
+	// uses 185 filedesc's for open *.so shared libs and *.go bytecode
+	// files, and another 25 for misc other stuff. So reserve that many
+	// plus a little more, for future expansion.  This is a bit blunt.
+	struct rlimit maxfh;
+	getrlimit(RLIMIT_NOFILE, &maxfh);
+	size_t max_of = maxfh.rlim_cur;
+	if (256 < max_of) max_of -= 230;
+	else
+		throw IOException(TRACE_INFO,
+			"Open file limit too low. Set ulimit -n 1024 or larger!");
+
+	options.max_open_files = max_of;
 
 #if 0
 	// According to the RocksDB wiki, Bloom filters should make
@@ -180,6 +206,11 @@ void RocksStorage::print_stats(void)
 		count_records("a@"), count_records("l@"), count_records("n@"));
 	printf("Keys/Incoming/Hash k@: %lu i@: %lu h@: %lu\n",
 		count_records("k@"), count_records("i@"), count_records("h@"));
+
+	printf("\n");
+	struct rlimit maxfh;
+	getrlimit(RLIMIT_NOFILE, &maxfh);
+	printf("Unix max open files lim=%lu %lu\n", maxfh.rlim_cur, maxfh.rlim_max);
 }
 
 DEFINE_NODE_FACTORY(RocksStorageNode, ROCKS_STORAGE_NODE)

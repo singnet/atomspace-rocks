@@ -48,13 +48,16 @@ distributed and/or decentralized AtomSpaces can be built.
 
 Status
 ------
-This is **Version 0.9.7**.  All unit tests pass.  This is effectively
-version 1.0; waiting on user feedback.
+This is **Version 1.0.1**.  All unit tests pass.  It has been used in
+at least one "serious" project to process many millions of Atoms.
+
+This code is 2x or 3x faster than Postgres on synthetic benchmarks,
+and has been observed to run 12x faster in a real-world application.
 
 
 Example Usage
 -------------
-Well, see the examples directory for details. But, in brief:
+See the examples directory for details. In brief:
 
 ```
 $ guile
